@@ -1,23 +1,42 @@
 #include "common.h"
 #include <mpi.h>
-
-// Put any static global variables here that you will use throughout the simulation.
-
-#include "common.h"
 #include <cmath>
 #include <vector>
 #include <algorithm>
 
-// I use linked-lists instead of vectors for bins because it's much faster to
-// prepend to a linked list than to append to a vector. This is a common technique
-// and based by implementation off this writeup https://aiichironakano.github.io/cs596/01-1LinkedListCell.pdf
-// Google Gemini was used to help discover this approach and also conceputalize why it is better
 
-static int num_bins_per_dim; // Number of bins along one dimension
-static int total_bins; // Total number of bins in the grid
-static int* bin_heads = nullptr; // Array of bin heads for linked list
-static int* next_particle = nullptr; // Array of next particle indices for linked list
-#define LIST_END -1
+static double bin_size = cutoff;
+
+static int num_bins_per_dim; // Calculated in init_simulation based on size and cutoff
+
+static double slice_height; // Calculated values for dimensions of this slice
+static double local_y_min;
+static double local_y_max;
+
+static int local_start_by; // The range of bins we are responsible for (inclusive)
+static int local_end_by;
+static int local_num_rows;
+
+static MPI_Datatype MPI_PARTICLE;           // MPI datatype for particle_t
+static std::vector<particle_t> local_parts; // All local particles (including ghosts) for this process
+
+// Persistent buffers to prevent memory reallocation every frame
+static std::vector<std::vector<int>> bins; 
+static std::vector<particle_t> tx_up_buf, tx_down_buf;
+static std::vector<particle_t> rx_up_buf, rx_down_buf;
+static std::vector<particle_t> move_up_buf, move_down_buf;
+static std::vector<particle_t> incoming_parts; // Used for both ghost AND migrant exchanges;
+
+static std::pair<int, int> directions[] = {
+    {-1, -1},
+    {-1, 0},
+    {-1, 1},
+    {0, -1},
+    {0, 1},  
+    {1, -1},
+    {1, 0},
+    {1, 1} 
+};
 
 // Apply the force from neighbor to particle
 void apply_force(particle_t& particle, particle_t& neighbor) {
@@ -37,8 +56,28 @@ void apply_force(particle_t& particle, particle_t& neighbor) {
     double coef = (1 - cutoff / r) / r2 / mass;
     particle.ax += coef * dx;
     particle.ay += coef * dy;
+}
 
-    // Apply an equal and opposite force to neighbor
+// Apply symmetric force (Newton's 3rd Law) for particles in the same bin
+void apply_symmetric_force(particle_t& particle, particle_t& neighbor) {
+    // Calculate Distance
+    double dx = neighbor.x - particle.x;
+    double dy = neighbor.y - particle.y;
+    double r2 = dx * dx + dy * dy;
+
+    // Check if the two particles should interact
+    if (r2 > cutoff * cutoff)
+        return;
+
+    r2 = fmax(r2, min_r * min_r);
+    double r = sqrt(r2);
+
+    // Very simple short-range repulsive force
+    double coef = (1 - cutoff / r) / r2 / mass;
+    particle.ax += coef * dx;
+    particle.ay += coef * dy;
+
+    // Apply equal and opposite force to the neighbor
     neighbor.ax -= coef * dx;
     neighbor.ay -= coef * dy;
 }
@@ -64,136 +103,252 @@ void move(particle_t& p, double size) {
     }
 }
 
-// I adopted this approach as it is a familier "LeetCode" algorithm style on grid problems (like connect4)
-static std::pair<int, int> directions[] = {
-    // {Drow, Dcol}
-    {0, 1},  // E
-    {1, -1}, // SW
-    {1, 0},  // S
-    {1, 1},   // SE
+// Helper to exchange variable-length vectors using persistent buffers
+void exchange_particles(std::vector<particle_t>& send_up, std::vector<particle_t>& send_down, 
+                        std::vector<particle_t>& received, int rank, int num_procs) {
+    int count_send_up = send_up.size();
+    int count_send_down = send_down.size();
+    int count_recv_up = 0, count_recv_down = 0;
 
-    // We don't need to double count, so we only expand to the bottom-right direction
-};
+    MPI_Request reqs[4];
+    int req_cnt = 0;
 
-void init_simulation_serial(particle_t* parts, int num_parts, double size) {
-    // Resize a grid bin to be the size of the cutoff
-    num_bins_per_dim = ceil(size / cutoff);
-    total_bins = num_bins_per_dim * num_bins_per_dim;
-
-    // Allocate memory for bin heads and linked list of particles if not already allocated
-    if (bin_heads == nullptr) {
-        bin_heads = new int[total_bins];
-        next_particle = new int[num_parts];
+    // 1. Exchange counts
+    if (rank > 0) {
+        MPI_Isend(&count_send_up, 1, MPI_INT, rank - 1, 0, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        MPI_Irecv(&count_recv_up, 1, MPI_INT, rank - 1, 1, MPI_COMM_WORLD, &reqs[req_cnt++]);
     }
+    if (rank < num_procs - 1) {
+        MPI_Isend(&count_send_down, 1, MPI_INT, rank + 1, 1, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        MPI_Irecv(&count_recv_down, 1, MPI_INT, rank + 1, 0, MPI_COMM_WORLD, &reqs[req_cnt++]);
+    }
+    MPI_Waitall(req_cnt, reqs, MPI_STATUSES_IGNORE);
+
+    // 2. Resize persistent receive buffers
+    rx_up_buf.resize(count_recv_up);
+    rx_down_buf.resize(count_recv_down);
+    req_cnt = 0;
+
+    // 3. Exchange data
+    if (rank > 0) {
+        if (count_send_up > 0) MPI_Isend(send_up.data(), count_send_up, MPI_PARTICLE, rank - 1, 2, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        if (count_recv_up > 0) MPI_Irecv(rx_up_buf.data(), count_recv_up, MPI_PARTICLE, rank - 1, 3, MPI_COMM_WORLD, &reqs[req_cnt++]);
+    }
+    if (rank < num_procs - 1) {
+        if (count_send_down > 0) MPI_Isend(send_down.data(), count_send_down, MPI_PARTICLE, rank + 1, 3, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        if (count_recv_down > 0) MPI_Irecv(rx_down_buf.data(), count_recv_down, MPI_PARTICLE, rank + 1, 2, MPI_COMM_WORLD, &reqs[req_cnt++]);
+    }
+    MPI_Waitall(req_cnt, reqs, MPI_STATUSES_IGNORE);
+
+    // 4. Append to output buffer
+    received.clear();
+    received.insert(received.end(), rx_up_buf.begin(), rx_up_buf.end());
+    received.insert(received.end(), rx_down_buf.begin(), rx_down_buf.end());
 }
 
-void set_bin_coordinates(double x, double y, double size, int& bx, int& by) {
-    bx = int(x / cutoff);
-    by = int(y / cutoff);
+void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
 
-    // Safety clamp in case a particle is exactly on the upper boundary
-    if (bx < 0) {
-        bx = 0;
-    } else if (bx >= num_bins_per_dim) {
-        bx = num_bins_per_dim - 1;
+    // 1. Exchange Ghosts
+    tx_up_buf.clear();
+    tx_down_buf.clear();
+
+    for (const auto& p : local_parts) {
+        // If a particle is within `cutoff` from our border, it is a ghost to the 
+        // neighboring process!
+
+        if (rank > 0 && p.y < local_y_min + cutoff) {
+            tx_up_buf.push_back(p);
+        }
+        if (rank < num_procs - 1 && p.y > local_y_max - cutoff) {
+            tx_down_buf.push_back(p);
+        }
     }
 
-    if (by < 0) {
-        by = 0;
-    } else if (by >= num_bins_per_dim) {
-        by = num_bins_per_dim - 1;
+    // Append ghosts directly for easy binning
+    // If the index of a particle is >= num_local, it is a ghost!
+    int num_local = local_parts.size();
+    exchange_particles(tx_up_buf, tx_down_buf, incoming_parts, rank, num_procs);
+    local_parts.insert(local_parts.end(), incoming_parts.begin(), incoming_parts.end());
+    int total_parts = local_parts.size();
+
+    // 2. Clear bins
+    for (auto& bin : bins){
+        bin.clear();
     }
-}
-
-void simulate_one_step_serial(particle_t* parts, int num_parts, double size) {
-
-    // Clear grid: Initialize all heads to empty
-    for (int i = 0; i < total_bins; ++i) {
-        bin_heads[i] = LIST_END;
-    }
-
-    // Reset accelerations
-    for (int i = 0; i < num_parts; ++i) {
-        parts[i].ax = 0;
-        parts[i].ay = 0;
+    
+    // 3. Clear accelerations
+    for (int i = 0; i < num_local; ++i) {
+        local_parts[i].ax = 0;
+        local_parts[i].ay = 0;
     }
 
-    // Compute which particles are in which bins
-    for (int i = 0; i < num_parts; ++i) {
+    // 4. Bin particles
+    int y_offset = std::max(0, local_start_by - 1); // Account for the top ghost row
 
-        int bx, by;
-        set_bin_coordinates(parts[i].x, parts[i].y, size, bx, by);
-        int bin_index = by * num_bins_per_dim + bx;
+    for (int i = 0; i < total_parts; ++i) {
+        int bx = std::max(0, std::min((int)(local_parts[i].x / cutoff), num_bins_per_dim - 1));
+        int by = std::max(0, std::min((int)(local_parts[i].y / cutoff), num_bins_per_dim - 1));
 
-        // Add particle (index) to the head of bin linked list
-        next_particle[i] = bin_heads[bin_index];
-        bin_heads[bin_index] = i;
+        int local_by = by - y_offset;
+        if (local_by >= 0 && local_by < local_num_rows) {
+            bins[local_by * num_bins_per_dim + bx].push_back(i);
+        }
     }
 
-    // Compute forces
-    for (int by = 0; by < num_bins_per_dim; ++by) {
+    // 5. Compute forces
+    for (int by = local_start_by; by <= local_end_by; ++by) {
+        int local_by = by - y_offset;
         for (int bx = 0; bx < num_bins_per_dim; ++bx) {
-            int bin_index = by * num_bins_per_dim + bx;
 
-            // Check inside same bin
-            // Notice the tail is always LIST_END
-            for (int i = bin_heads[bin_index]; i != LIST_END; i = next_particle[i]) {
-                for (int j = next_particle[i]; j != LIST_END; j = next_particle[j]) {
-                    apply_force(parts[i], parts[j]);
-                }
-            }
+            // We have selected a bin globally at (bx, by), relatively at (bx, local_by)
 
-            for (auto dir : directions) {
-                int dy = dir.first;
-                int dx = dir.second;
+            int bin_index = local_by * num_bins_per_dim + bx;
+            auto& current_bin = bins[bin_index];
 
-                int ny = by + dy;
-                int nx = bx + dx;
+            // Same bin interactions
+            for (size_t i = 0; i < current_bin.size(); ++i) {
+                int p1_idx = current_bin[i];
 
-                if (ny < 0 || ny >= num_bins_per_dim || nx < 0 || nx >= num_bins_per_dim) {
+                // Do not apply forces from ghosts to other particles
+                if (p1_idx >= num_local) {
                     continue;
                 }
 
-                int nbin_index = ny * num_bins_per_dim + nx;
+                for (size_t j = i + 1; j < current_bin.size(); ++j) {
+                    int p2_idx = current_bin[j];
+                    if (p2_idx < num_local) {
+                        apply_symmetric_force(local_parts[p1_idx], local_parts[p2_idx]);
+                    } else {
 
-                // Compute forces between current bin and neighbor bin
-                for (int i = bin_heads[bin_index]; i != LIST_END; i = next_particle[i]) {
-                    for (int j = bin_heads[nbin_index]; j != LIST_END; j = next_particle[j]) {
-                        apply_force(parts[i], parts[j]);
+                        // We apply one direction of force on ghosts since they won't be applying forces back on us
+                        apply_force(local_parts[p1_idx], local_parts[p2_idx]);
+                    }
+                }
+            }
+
+            // Neighbor bin interactions
+            for (auto dir : directions) {
+                int nx = bx + dir.second;
+                int ny = by + dir.first;
+                int n_local_by = ny - y_offset;
+
+                // If the neighbor bin is out of bounds, skip it
+                if (nx < 0 || nx >= num_bins_per_dim || n_local_by < 0 || n_local_by >= local_num_rows) {
+                    continue;
+                }
+
+                int nbin_index = n_local_by * num_bins_per_dim + nx;
+                for (int p1_idx : current_bin) {
+
+                    // Again do not apply forces from ghosts to other particles
+                    if (p1_idx >= num_local) {
+                        continue;
+                    }
+
+                    for (int p2_idx : bins[nbin_index]) {
+                        apply_force(local_parts[p1_idx], local_parts[p2_idx]);
                     }
                 }
             }
         }
     }
 
-    // Move Particles
+    // 5. Strip ghosts 
+    local_parts.resize(num_local); // Drops all ghosts off back of vector
+
+    // 6. Move locally owned particles
+    for (int i = 0; i < num_local; ++i) {
+        move(local_parts[i], size);
+    }
+
+    // 7. Migrate particles that have moved
+    move_up_buf.clear();
+    move_down_buf.clear();
+    
+    // The order of the vector doesn't matter so it is more efficient to drop the end and swap
+    for (int i = local_parts.size() - 1; i >= 0; --i) {
+        int owner_rank = std::min((int)(local_parts[i].y / slice_height), num_procs - 1);
+        if (owner_rank < rank) {
+            move_up_buf.push_back(local_parts[i]);
+            local_parts[i] = local_parts.back();
+            local_parts.pop_back();
+        } else if (owner_rank > rank) {
+            move_down_buf.push_back(local_parts[i]);
+            local_parts[i] = local_parts.back();
+            local_parts.pop_back();
+        }
+    }
+
+    exchange_particles(move_up_buf, move_down_buf, incoming_parts, rank, num_procs);
+    local_parts.insert(local_parts.end(), incoming_parts.begin(), incoming_parts.end()); // Add incoming particles
+}
+
+void init_simulation(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
+
+    // Define the particle_t type for MPI
+    MPI_Type_contiguous(sizeof(particle_t), MPI_BYTE, &MPI_PARTICLE);
+    MPI_Type_commit(&MPI_PARTICLE);
+
+    num_bins_per_dim = ceil(size / cutoff);
+    slice_height = size / num_procs;
+    local_y_min = rank * slice_height;
+    local_y_max = (rank + 1) * slice_height;
+    if (rank == num_procs - 1) {
+        local_y_max = size;
+    }
+
+    local_start_by = std::max(0, (int) (local_y_min / cutoff));
+    local_end_by = std::min(num_bins_per_dim - 1, (int) (local_y_max / cutoff));
+
+    // +2 for ghost rows above and below our slice
+    local_num_rows = (local_end_by - local_start_by + 1) + 2;
+    bins.resize(local_num_rows * num_bins_per_dim);
+
+    local_parts.clear();
+
+    // I have found in hw3 that using vectors over linked lists incurs a big overhead.
+    // But, we need vectors for memory contiguousness for messaging with MPI. To avoid the big overhead
+    // of reallocation, we can just reserve a good amount.
+    int estimated_load = (num_parts / num_procs) * 1.5; // 50% buffer
+    local_parts.reserve(estimated_load);
+    tx_up_buf.reserve(estimated_load / 10); // Assume fewer particles are near border
+    tx_down_buf.reserve(estimated_load / 10);
+    rx_up_buf.reserve(estimated_load / 10);
+    rx_down_buf.reserve(estimated_load / 10);
+    move_up_buf.reserve(estimated_load / 10);
+    move_down_buf.reserve(estimated_load / 10);
+    incoming_parts.reserve(estimated_load / 5); // Assume some more migrants than ghosts
+
     for (int i = 0; i < num_parts; ++i) {
-        move(parts[i], size);
+        if (parts[i].y >= local_y_min && parts[i].y < local_y_max) {
+            local_parts.push_back(parts[i]);
+        } else if (rank == num_procs - 1 && parts[i].y == size) { 
+            local_parts.push_back(parts[i]);
+        }
     }
 }
 
-
-void init_simulation(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
-	// You can use this space to initialize data objects that you may need
-	// This function will be called once before the algorithm begins
-	// Do not do any particle simulation here
-    init_simulation_serial(parts, num_parts, size);
-}
-
-void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
-    // Write this function
-    simulate_one_step_serial(parts, num_parts, size);
-}
-
 void gather_for_save(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
-    // Write this function such that at the end of it, the master (rank == 0)
-    // processor has an in-order view of all particles. That is, the array
-    // parts is complete and sorted by particle id.
-    if (num_procs == 1) {
-        // Rank 0 already has all particles. Just sort them by ID.
+
+    // Gather the number of particles from each process
+    int local_count = local_parts.size();
+    std::vector<int> recv_counts(num_procs);
+    MPI_Gather(&local_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    std::vector<int> displs(num_procs, 0); // Displacements for Gatherv
+    if (rank == 0) {
+        for (int i = 1; i < num_procs; ++i) {
+            displs[i] = displs[i-1] + recv_counts[i-1];
+        }
+    }
+
+    MPI_Gatherv(local_parts.data(), local_count, MPI_PARTICLE,
+                parts, recv_counts.data(), displs.data(), MPI_PARTICLE,
+                0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
         std::sort(parts, parts + num_parts, [](const particle_t& a, const particle_t& b) {
-            return a.id < b.id; // Assumes your particle_t struct has an 'id' field
+            return a.id < b.id;
         });
-        return;
     }
 }
