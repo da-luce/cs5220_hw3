@@ -4,6 +4,20 @@
 #include <vector>
 #include <algorithm>
 
+// VARIABLES FOR SERIAL
+
+static int serial_num_bins_per_dim; // Number of bins along one dimension
+static int total_bins; // Total number of bins in the grid
+static int* bin_heads = nullptr; // Array of bin heads for linked list
+static int* next_particle = nullptr; // Array of next particle indices for linked list
+#define LIST_END -1
+
+
+static std::pair<int, int> serial_directions[] = {
+    {0, 1}, {1, -1}, {1, 0}, {1, 1}
+};
+
+// VARIABLES FOR PARALLEL 
 
 static double bin_size = cutoff;
 
@@ -38,6 +52,7 @@ static std::pair<int, int> directions[] = {
     {1, 0},
     {1, 1} 
 };
+
 
 // Apply the force from neighbor to particle
 void apply_force(particle_t& particle, particle_t& neighbor) {
@@ -104,6 +119,117 @@ void move(particle_t& p, double size) {
     }
 }
 
+// SERIAL IMPLEMENTATION (from hw2)
+
+void serial_init_simulation(particle_t* parts, int num_parts, double size) {
+    // Resize a grid bin to be the size of the cutoff
+    serial_num_bins_per_dim = ceil(size / cutoff);
+    total_bins = serial_num_bins_per_dim * serial_num_bins_per_dim;
+
+    // Allocate memory for bin heads and linked list of particles if not already allocated
+    if (bin_heads == nullptr) {
+        bin_heads = new int[total_bins];
+        next_particle = new int[num_parts];
+    }
+}
+
+void set_bin_coordinates(double x, double y, double size, int& bx, int& by) {
+    bx = int(x / cutoff);
+    by = int(y / cutoff);
+
+    // Safety clamp in case a particle is exactly on the upper boundary
+    if (bx < 0) {
+        bx = 0;
+    } else if (bx >= serial_num_bins_per_dim) {
+        bx = serial_num_bins_per_dim - 1;
+    }
+
+    if (by < 0) {
+        by = 0;
+    } else if (by >= serial_num_bins_per_dim) {
+        by = serial_num_bins_per_dim - 1;
+    }
+}
+
+void serial_simulate_one_step(particle_t* parts, int num_parts, double size) {
+
+    // Clear grid: Initialize all heads to empty
+    for (int i = 0; i < total_bins; ++i) {
+        bin_heads[i] = LIST_END;
+    }
+
+    // Reset accelerations
+    for (int i = 0; i < num_parts; ++i) {
+        parts[i].ax = 0;
+        parts[i].ay = 0;
+    }
+
+    // Compute which particles are in which bins
+    for (int i = 0; i < num_parts; ++i) {
+
+        int bx, by;
+        set_bin_coordinates(parts[i].x, parts[i].y, size, bx, by);
+        int bin_index = by * serial_num_bins_per_dim + bx;
+
+        // Add particle (index) to the head of bin linked list
+        next_particle[i] = bin_heads[bin_index];
+        bin_heads[bin_index] = i;
+    }
+
+    // Compute forces
+    for (int by = 0; by < serial_num_bins_per_dim; ++by) {
+        for (int bx = 0; bx < serial_num_bins_per_dim; ++bx) {
+            int bin_index = by * serial_num_bins_per_dim + bx;
+
+            // Check inside same bin
+            // Notice the tail is always LIST_END
+            for (int i = bin_heads[bin_index]; i != LIST_END; i = next_particle[i]) {
+                for (int j = next_particle[i]; j != LIST_END; j = next_particle[j]) {
+                    apply_symmetric_force(parts[i], parts[j]);
+                }
+            }
+
+            for (auto dir : serial_directions) {
+                int dy = dir.first;
+                int dx = dir.second;
+
+                int ny = by + dy;
+                int nx = bx + dx;
+
+                if (ny < 0 || ny >= serial_num_bins_per_dim || nx < 0 || nx >= serial_num_bins_per_dim) {
+                    continue;
+                }
+
+                int nbin_index = ny * serial_num_bins_per_dim + nx;
+
+                // Compute forces between current bin and neighbor bin
+                for (int i = bin_heads[bin_index]; i != LIST_END; i = next_particle[i]) {
+                    for (int j = bin_heads[nbin_index]; j != LIST_END; j = next_particle[j]) {
+                        apply_symmetric_force(parts[i], parts[j]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Move Particles
+    for (int i = 0; i < num_parts; ++i) {
+        move(parts[i], size);
+    }
+}
+
+void serial_gather_for_save(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
+    // Write this function such that at the end of it, the master (rank == 0)
+    // processor has an in-order view of all particles. That is, the array
+    // parts is complete and sorted by particle id.
+
+    // Rank 0 already has all particles. Just sort them by ID.
+    std::sort(parts, parts + num_parts, [](const particle_t& a, const particle_t& b) {
+        return a.id < b.id;
+    });
+    return;
+}
+
 // Helper to exchange variable-length vectors using the static buffers
 void exchange_particles(std::vector<particle_t>& send_up, std::vector<particle_t>& send_down, 
                         std::vector<particle_t>& received, int rank, int num_procs) {
@@ -166,6 +292,12 @@ void exchange_particles(std::vector<particle_t>& send_up, std::vector<particle_t
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
+
+    // Fast track
+    if (num_procs == 1) {
+        serial_simulate_one_step(parts, num_parts, size);
+        return;
+    }
 
     // 1. Exchange Ghosts
     tx_up_buf.clear();
@@ -304,6 +436,12 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
 
 void init_simulation(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
 
+    // Fast track
+    if (num_procs == 1) {
+        serial_init_simulation(parts, num_parts, size);
+        return;
+    }
+
     // Define the particle_t type for MPI
     MPI_Type_contiguous(sizeof(particle_t), MPI_BYTE, &MPI_PARTICLE);
     MPI_Type_commit(&MPI_PARTICLE);
@@ -348,6 +486,12 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 }
 
 void gather_for_save(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
+
+    // Fast track
+    if (num_procs == 1) {
+        serial_gather_for_save(parts, num_parts, size, rank, num_procs);
+        return;
+    }
 
     // Gather the number of particles from each process
     int local_count = local_parts.size();
