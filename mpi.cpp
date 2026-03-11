@@ -27,6 +27,7 @@ static std::vector<particle_t> rx_up_buf, rx_down_buf;
 static std::vector<particle_t> move_up_buf, move_down_buf;
 static std::vector<particle_t> incoming_parts; // Used for both ghost AND migrant exchanges;
 
+// Use same direction approach as in hw2
 static std::pair<int, int> directions[] = {
     {-1, -1},
     {-1, 0},
@@ -58,7 +59,7 @@ void apply_force(particle_t& particle, particle_t& neighbor) {
     particle.ay += coef * dy;
 }
 
-// Apply symmetric force (Newton's 3rd Law) for particles in the same bin
+// Apply symmetric force for particles in the same bin
 void apply_symmetric_force(particle_t& particle, particle_t& neighbor) {
     // Calculate Distance
     double dx = neighbor.x - particle.x;
@@ -103,40 +104,58 @@ void move(particle_t& p, double size) {
     }
 }
 
-// Helper to exchange variable-length vectors using persistent buffers
+// Helper to exchange variable-length vectors using the static buffers
 void exchange_particles(std::vector<particle_t>& send_up, std::vector<particle_t>& send_down, 
                         std::vector<particle_t>& received, int rank, int num_procs) {
+
     int count_send_up = send_up.size();
     int count_send_down = send_down.size();
     int count_recv_up = 0, count_recv_down = 0;
 
-    MPI_Request reqs[4];
+    // Used Google Gemini to help understand the use of tags in order to avoid deadlock, since we
+    // didn't really discuss tags in lecture. Here, tags are used to differentiate
+    // between the two directions of communication.
+
+    MPI_Request reqs[4]; // (Up + Down) x (Send + Recv) = 4 possible operations
     int req_cnt = 0;
 
-    // 1. Exchange counts
+    // 1. Exchange counts of particles to send
     if (rank > 0) {
-        MPI_Isend(&count_send_up, 1, MPI_INT, rank - 1, 0, MPI_COMM_WORLD, &reqs[req_cnt++]);
-        MPI_Irecv(&count_recv_up, 1, MPI_INT, rank - 1, 1, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        MPI_Isend(&count_send_up, 1, MPI_INT, rank - 1, 0, MPI_COMM_WORLD, &reqs[req_cnt++]); // Number to send up
+        MPI_Irecv(&count_recv_up, 1, MPI_INT, rank - 1, 1, MPI_COMM_WORLD, &reqs[req_cnt++]); // Number to receive from up
     }
     if (rank < num_procs - 1) {
-        MPI_Isend(&count_send_down, 1, MPI_INT, rank + 1, 1, MPI_COMM_WORLD, &reqs[req_cnt++]);
-        MPI_Irecv(&count_recv_down, 1, MPI_INT, rank + 1, 0, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        MPI_Isend(&count_send_down, 1, MPI_INT, rank + 1, 1, MPI_COMM_WORLD, &reqs[req_cnt++]); // Number to send down
+        MPI_Irecv(&count_recv_down, 1, MPI_INT, rank + 1, 0, MPI_COMM_WORLD, &reqs[req_cnt++]); // Number to receive from down
     }
-    MPI_Waitall(req_cnt, reqs, MPI_STATUSES_IGNORE);
+    MPI_Waitall(req_cnt, reqs, MPI_STATUSES_IGNORE); // Wait for counts to be exchanged before resizing buffers
 
-    // 2. Resize persistent receive buffers
+    // 2. Resize receive buffers
     rx_up_buf.resize(count_recv_up);
     rx_down_buf.resize(count_recv_down);
     req_cnt = 0;
 
-    // 3. Exchange data
+    // 3. Exchange particle data
     if (rank > 0) {
-        if (count_send_up > 0) MPI_Isend(send_up.data(), count_send_up, MPI_PARTICLE, rank - 1, 2, MPI_COMM_WORLD, &reqs[req_cnt++]);
-        if (count_recv_up > 0) MPI_Irecv(rx_up_buf.data(), count_recv_up, MPI_PARTICLE, rank - 1, 3, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        if (count_send_up > 0) {
+            // Send to rank - 1
+            MPI_Isend(send_up.data(), count_send_up, MPI_PARTICLE, rank - 1, 2, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        }
+        if (count_recv_up > 0) {
+            // Receive from rank - 1
+            MPI_Irecv(rx_up_buf.data(), count_recv_up, MPI_PARTICLE, rank - 1, 3, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        }
     }
+
     if (rank < num_procs - 1) {
-        if (count_send_down > 0) MPI_Isend(send_down.data(), count_send_down, MPI_PARTICLE, rank + 1, 3, MPI_COMM_WORLD, &reqs[req_cnt++]);
-        if (count_recv_down > 0) MPI_Irecv(rx_down_buf.data(), count_recv_down, MPI_PARTICLE, rank + 1, 2, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        if (count_send_down > 0) {
+            // Send to rank + 1
+            MPI_Isend(send_down.data(), count_send_down, MPI_PARTICLE, rank + 1, 3, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        }
+        if (count_recv_down > 0) {
+            // Receive from rank + 1
+            MPI_Irecv(rx_down_buf.data(), count_recv_down, MPI_PARTICLE, rank + 1, 2, MPI_COMM_WORLD, &reqs[req_cnt++]);
+        }
     }
     MPI_Waitall(req_cnt, reqs, MPI_STATUSES_IGNORE);
 
@@ -175,7 +194,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
     for (auto& bin : bins){
         bin.clear();
     }
-    
+
     // 3. Clear accelerations
     for (int i = 0; i < num_local; ++i) {
         local_parts[i].ax = 0;
@@ -253,18 +272,18 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
         }
     }
 
-    // 5. Strip ghosts 
+    // 6. Strip ghosts 
     local_parts.resize(num_local); // Drops all ghosts off back of vector
 
-    // 6. Move locally owned particles
+    // 7. Move locally owned particles
     for (int i = 0; i < num_local; ++i) {
         move(local_parts[i], size);
     }
 
-    // 7. Migrate particles that have moved
+    // 8. Migrate particles that have moved
     move_up_buf.clear();
     move_down_buf.clear();
-    
+
     // The order of the vector doesn't matter so it is more efficient to drop the end and swap
     for (int i = local_parts.size() - 1; i >= 0; --i) {
         int owner_rank = std::min((int)(local_parts[i].y / slice_height), num_procs - 1);
@@ -335,17 +354,22 @@ void gather_for_save(particle_t* parts, int num_parts, double size, int rank, in
     std::vector<int> recv_counts(num_procs);
     MPI_Gather(&local_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    std::vector<int> displs(num_procs, 0); // Displacements for Gatherv
+    // Track where each segment of particles starts
+    std::vector<int> displacements(num_procs, 0);
     if (rank == 0) {
         for (int i = 1; i < num_procs; ++i) {
-            displs[i] = displs[i-1] + recv_counts[i-1];
+            displacements[i] = displacements[i-1] + recv_counts[i-1];
         }
     }
 
+    // Do the actual gather of particles
     MPI_Gatherv(local_parts.data(), local_count, MPI_PARTICLE,
-                parts, recv_counts.data(), displs.data(), MPI_PARTICLE,
+                parts, recv_counts.data(), displacements.data(), MPI_PARTICLE,
                 0, MPI_COMM_WORLD);
 
+    // Sort for rank = 0
+    // I tried a distributed sort then merge on rank 0, but ended up having poorer PE
+    // (though sometimes better absolute runtime)
     if (rank == 0) {
         std::sort(parts, parts + num_parts, [](const particle_t& a, const particle_t& b) {
             return a.id < b.id;
