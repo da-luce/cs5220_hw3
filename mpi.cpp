@@ -4,7 +4,7 @@
 #include <vector>
 #include <algorithm>
 
-// VARIABLES FOR SERIAL
+// VARIABLES FOR SERIAL - same implementation as hw2
 
 static int serial_num_bins_per_dim; // Number of bins along one dimension
 static int total_bins; // Total number of bins in the grid
@@ -12,12 +12,11 @@ static int* bin_heads = nullptr; // Array of bin heads for linked list
 static int* next_particle = nullptr; // Array of next particle indices for linked list
 #define LIST_END -1
 
-
 static std::pair<int, int> serial_directions[] = {
     {0, 1}, {1, -1}, {1, 0}, {1, 1}
 };
 
-// VARIABLES FOR PARALLEL 
+// VARIABLES FOR PARALLEL
 
 static double bin_size = cutoff;
 
@@ -236,54 +235,57 @@ void exchange_particles(std::vector<particle_t>& send_up, std::vector<particle_t
 
     int count_send_up = send_up.size();
     int count_send_down = send_down.size();
-    int count_recv_up = 0, count_recv_down = 0;
+    int count_recv_up = 0;
+    int count_recv_down = 0;
 
     // Used Google Gemini to help understand the use of tags in order to avoid deadlock, since we
     // didn't really discuss tags in lecture. Here, tags are used to differentiate
     // between the two directions of communication.
 
+    // Also didn't discuss blocking on multiple Isends/Irecvs at the same time, so I used AI to help understand
+    // how to do that
     MPI_Request reqs[4]; // (Up + Down) x (Send + Recv) = 4 possible operations
-    int req_cnt = 0;
+    int request_count = 0;
 
     // 1. Exchange counts of particles to send
     if (rank > 0) {
-        MPI_Isend(&count_send_up, 1, MPI_INT, rank - 1, 0, MPI_COMM_WORLD, &reqs[req_cnt++]); // Number to send up
-        MPI_Irecv(&count_recv_up, 1, MPI_INT, rank - 1, 1, MPI_COMM_WORLD, &reqs[req_cnt++]); // Number to receive from up
+        MPI_Isend(&count_send_up, 1, MPI_INT, rank - 1, 0, MPI_COMM_WORLD, &reqs[request_count++]); // Number to send up
+        MPI_Irecv(&count_recv_up, 1, MPI_INT, rank - 1, 1, MPI_COMM_WORLD, &reqs[request_count++]); // Number to receive from up
     }
     if (rank < num_procs - 1) {
-        MPI_Isend(&count_send_down, 1, MPI_INT, rank + 1, 1, MPI_COMM_WORLD, &reqs[req_cnt++]); // Number to send down
-        MPI_Irecv(&count_recv_down, 1, MPI_INT, rank + 1, 0, MPI_COMM_WORLD, &reqs[req_cnt++]); // Number to receive from down
+        MPI_Isend(&count_send_down, 1, MPI_INT, rank + 1, 1, MPI_COMM_WORLD, &reqs[request_count++]); // Number to send down
+        MPI_Irecv(&count_recv_down, 1, MPI_INT, rank + 1, 0, MPI_COMM_WORLD, &reqs[request_count++]); // Number to receive from down
     }
-    MPI_Waitall(req_cnt, reqs, MPI_STATUSES_IGNORE); // Wait for counts to be exchanged before resizing buffers
+    MPI_Waitall(request_count, reqs, MPI_STATUSES_IGNORE); // Wait for counts to be exchanged before resizing buffers
 
     // 2. Resize receive buffers
     rx_up_buf.resize(count_recv_up);
     rx_down_buf.resize(count_recv_down);
-    req_cnt = 0;
+    request_count = 0;
 
     // 3. Exchange particle data
     if (rank > 0) {
         if (count_send_up > 0) {
             // Send to rank - 1
-            MPI_Isend(send_up.data(), count_send_up, MPI_PARTICLE, rank - 1, 2, MPI_COMM_WORLD, &reqs[req_cnt++]);
+            MPI_Isend(send_up.data(), count_send_up, MPI_PARTICLE, rank - 1, 2, MPI_COMM_WORLD, &reqs[request_count++]);
         }
         if (count_recv_up > 0) {
             // Receive from rank - 1
-            MPI_Irecv(rx_up_buf.data(), count_recv_up, MPI_PARTICLE, rank - 1, 3, MPI_COMM_WORLD, &reqs[req_cnt++]);
+            MPI_Irecv(rx_up_buf.data(), count_recv_up, MPI_PARTICLE, rank - 1, 3, MPI_COMM_WORLD, &reqs[request_count++]);
         }
     }
 
     if (rank < num_procs - 1) {
         if (count_send_down > 0) {
             // Send to rank + 1
-            MPI_Isend(send_down.data(), count_send_down, MPI_PARTICLE, rank + 1, 3, MPI_COMM_WORLD, &reqs[req_cnt++]);
+            MPI_Isend(send_down.data(), count_send_down, MPI_PARTICLE, rank + 1, 3, MPI_COMM_WORLD, &reqs[request_count++]);
         }
         if (count_recv_down > 0) {
             // Receive from rank + 1
-            MPI_Irecv(rx_down_buf.data(), count_recv_down, MPI_PARTICLE, rank + 1, 2, MPI_COMM_WORLD, &reqs[req_cnt++]);
+            MPI_Irecv(rx_down_buf.data(), count_recv_down, MPI_PARTICLE, rank + 1, 2, MPI_COMM_WORLD, &reqs[request_count++]);
         }
     }
-    MPI_Waitall(req_cnt, reqs, MPI_STATUSES_IGNORE);
+    MPI_Waitall(request_count, reqs, MPI_STATUSES_IGNORE);
 
     // 4. Append to output buffer
     received.clear();
@@ -291,15 +293,81 @@ void exchange_particles(std::vector<particle_t>& send_up, std::vector<particle_t
     received.insert(received.end(), rx_down_buf.begin(), rx_down_buf.end());
 }
 
+// Helper to compute forces for range of rows using 8-direction, symmetric logic from hw2
+void compute_forces_for_rows(int start_row, int end_row, int y_offset, int num_local) {
+    for (int by = start_row; by <= end_row; ++by) {
+        int local_by = by - y_offset;
+        for (int bx = 0; bx < num_bins_per_dim; ++bx) {
+
+            // We have selected a bin globally at (bx, by), relatively at (bx, local_by)
+
+            int bin_index = local_by * num_bins_per_dim + bx;
+            auto& current_bin = bins[bin_index];
+
+            // Same bin interactions
+            for (size_t i = 0; i < current_bin.size(); ++i) {
+                int p1_idx = current_bin[i];
+
+                bool is_ghost_p1 = p1_idx >= num_local;
+
+                // Do not apply forces from ghosts to other particles
+                if (is_ghost_p1) {
+                    continue;
+                }
+
+                for (size_t j = i + 1; j < current_bin.size(); ++j) {
+                    int p2_idx = current_bin[j];
+
+                    bool is_ghost_p2 = p2_idx >= num_local;
+
+                    if (!is_ghost_p2) {
+                        apply_symmetric_force(local_parts[p1_idx], local_parts[p2_idx]);
+                    } else {
+                        // We apply one direction of force on ghosts since they won't be applying forces back on us
+                        apply_force(local_parts[p1_idx], local_parts[p2_idx]);
+                    }
+                }
+            }
+
+            // Neighbor bin interactions
+            for (auto dir : directions) {
+                int nx = bx + dir.second;
+                int ny = by + dir.first;
+                int n_local_by = ny - y_offset;
+
+                // If the neighbor bin is out of bounds, skip it
+                if (nx < 0 || nx >= num_bins_per_dim || n_local_by < 0 || n_local_by >= local_num_rows) {
+                    continue;
+                }
+
+                int nbin_index = n_local_by * num_bins_per_dim + nx;
+                for (int p1_idx : current_bin) {
+
+                    bool is_ghost_p1 = p1_idx >= num_local;
+
+                    // Again do not apply forces from ghosts to other particles
+                    if (is_ghost_p1) {
+                        continue;
+                    }
+
+                    for (int p2_idx : bins[nbin_index]) {
+                        apply_force(local_parts[p1_idx], local_parts[p2_idx]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
 
-    // Fast track
+    // Fast track for serial
     if (num_procs == 1) {
         serial_simulate_one_step(parts, num_parts, size);
         return;
     }
 
-    // 1. Exchange Ghosts
+    // 1. Exchange ghosts
     tx_up_buf.clear();
     tx_down_buf.clear();
 
@@ -315,12 +383,43 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
         }
     }
 
+    int count_send_up = tx_up_buf.size();
+    int count_send_down = tx_down_buf.size();
+    int count_recv_up = 0;
+    int count_recv_down = 0;
+
+    MPI_Request reqs_count[4], reqs_data[4];
+    int num_count_requests = 0; // Tracks number of count requests
+    int num_data_requests = 0; // Tracks number of data requests
+
+    // Exchange counts - this is blocking bc of the waitall
+    if (rank > 0) {
+        MPI_Isend(&count_send_up, 1, MPI_INT, rank - 1, 0, MPI_COMM_WORLD, &reqs_count[num_count_requests++]); // Number to send up
+        MPI_Irecv(&count_recv_up, 1, MPI_INT, rank - 1, 1, MPI_COMM_WORLD, &reqs_count[num_count_requests++]); // Number to receive from up
+    }
+    if (rank < num_procs - 1) {
+        MPI_Isend(&count_send_down, 1, MPI_INT, rank + 1, 1, MPI_COMM_WORLD, &reqs_count[num_count_requests++]); // Number to send down
+        MPI_Irecv(&count_recv_down, 1, MPI_INT, rank + 1, 0, MPI_COMM_WORLD, &reqs_count[num_count_requests++]); // Number to receive from down
+    }
+    MPI_Waitall(num_count_requests, reqs_count, MPI_STATUSES_IGNORE);
+
+    rx_up_buf.resize(count_recv_up);
+    rx_down_buf.resize(count_recv_down);
+
+    // Exchange data - and compute inner forces in the meantime
+    if (rank > 0) {
+        if (count_send_up > 0) MPI_Isend(tx_up_buf.data(), count_send_up, MPI_PARTICLE, rank - 1, 2, MPI_COMM_WORLD, &reqs_data[num_data_requests++]);
+        if (count_recv_up > 0) MPI_Irecv(rx_up_buf.data(), count_recv_up, MPI_PARTICLE, rank - 1, 3, MPI_COMM_WORLD, &reqs_data[num_data_requests++]);
+    }
+    if (rank < num_procs - 1) {
+        if (count_send_down > 0) MPI_Isend(tx_down_buf.data(), count_send_down, MPI_PARTICLE, rank + 1, 3, MPI_COMM_WORLD, &reqs_data[num_data_requests++]);
+        if (count_recv_down > 0) MPI_Irecv(rx_down_buf.data(), count_recv_down, MPI_PARTICLE, rank + 1, 2, MPI_COMM_WORLD, &reqs_data[num_data_requests++]);
+    }
+
     // Append ghosts directly for easy binning
     // If the index of a particle is >= num_local, it is a ghost!
     int num_local = local_parts.size();
-    exchange_particles(tx_up_buf, tx_down_buf, incoming_parts, rank, num_procs);
-    local_parts.insert(local_parts.end(), incoming_parts.begin(), incoming_parts.end());
-    int total_parts = local_parts.size();
+    int total_parts = num_local; // Will be updated after we receive ghosts
 
     // 2. Clear bins
     for (auto& bin : bins){
@@ -347,61 +446,40 @@ void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, 
     }
 
     // 5. Compute forces
-    for (int by = local_start_by; by <= local_end_by; ++by) {
+
+    // The range in which we can safely compute forces without worrying about ghosts on boundaries
+    int inner_start = local_start_by + 2;
+    int inner_end = local_end_by - 2;
+
+    if (inner_start <= inner_end) {
+        compute_forces_for_rows(inner_start, inner_end, y_offset, num_local);
+    }
+
+    // Wait for ghosts and add them
+    MPI_Waitall(num_data_requests, reqs_data, MPI_STATUSES_IGNORE);
+    local_parts.insert(local_parts.end(), rx_up_buf.begin(), rx_up_buf.end());
+    local_parts.insert(local_parts.end(), rx_down_buf.begin(), rx_down_buf.end());
+    total_parts = local_parts.size();
+
+    // Bin the newly arrived ghosts
+    for (int i = num_local; i < total_parts; ++i) {
+        int bx = std::max(0, std::min((int)(local_parts[i].x / cutoff), num_bins_per_dim - 1));
+        int by = std::max(0, std::min((int)(local_parts[i].y / cutoff), num_bins_per_dim - 1));
+
         int local_by = by - y_offset;
-        for (int bx = 0; bx < num_bins_per_dim; ++bx) {
-
-            // We have selected a bin globally at (bx, by), relatively at (bx, local_by)
-
-            int bin_index = local_by * num_bins_per_dim + bx;
-            auto& current_bin = bins[bin_index];
-
-            // Same bin interactions
-            for (size_t i = 0; i < current_bin.size(); ++i) {
-                int p1_idx = current_bin[i];
-
-                // Do not apply forces from ghosts to other particles
-                if (p1_idx >= num_local) {
-                    continue;
-                }
-
-                for (size_t j = i + 1; j < current_bin.size(); ++j) {
-                    int p2_idx = current_bin[j];
-                    if (p2_idx < num_local) {
-                        apply_symmetric_force(local_parts[p1_idx], local_parts[p2_idx]);
-                    } else {
-
-                        // We apply one direction of force on ghosts since they won't be applying forces back on us
-                        apply_force(local_parts[p1_idx], local_parts[p2_idx]);
-                    }
-                }
-            }
-
-            // Neighbor bin interactions
-            for (auto dir : directions) {
-                int nx = bx + dir.second;
-                int ny = by + dir.first;
-                int n_local_by = ny - y_offset;
-
-                // If the neighbor bin is out of bounds, skip it
-                if (nx < 0 || nx >= num_bins_per_dim || n_local_by < 0 || n_local_by >= local_num_rows) {
-                    continue;
-                }
-
-                int nbin_index = n_local_by * num_bins_per_dim + nx;
-                for (int p1_idx : current_bin) {
-
-                    // Again do not apply forces from ghosts to other particles
-                    if (p1_idx >= num_local) {
-                        continue;
-                    }
-
-                    for (int p2_idx : bins[nbin_index]) {
-                        apply_force(local_parts[p1_idx], local_parts[p2_idx]);
-                    }
-                }
-            }
+        if (local_by >= 0 && local_by < local_num_rows) {
+            bins[local_by * num_bins_per_dim + bx].push_back(i);
         }
+    }
+
+    // Process top boundary rows
+    int top_bound_end = std::min(local_end_by, inner_start - 1);
+    compute_forces_for_rows(local_start_by, top_bound_end, y_offset, num_local);
+
+    // Process bottom boundary rows
+    int bot_bound_start = std::max(top_bound_end + 1, inner_end + 1);
+    if (bot_bound_start <= local_end_by) {
+        compute_forces_for_rows(bot_bound_start, local_end_by, y_offset, num_local);
     }
 
     // 6. Strip ghosts 
