@@ -1,13 +1,13 @@
 ===== CS5220 HW3 LEADERBOARD SUBMISSION =====
 LEADERBOARD_NAME: amber-bear-418
-TIMESTAMP: 2026-03-12T03:22:02
+TIMESTAMP: 2026-03-13T03:20:08
 
 --- SERIAL-CORRECTNESS ---
-Simulation Time = 1.52774 seconds for 10000 particles.
-Simulation Time = 1.65448 seconds for 10000 particles.
-Simulation Time = 1.59573 seconds for 10000 particles.
-Simulation Time = 1.69884 seconds for 10000 particles.
-Simulation Time = 1.52924 seconds for 10000 particles.
+Simulation Time = 1.81206 seconds for 10000 particles.
+Simulation Time = 1.90846 seconds for 10000 particles.
+Simulation Time = 1.71886 seconds for 10000 particles.
+Simulation Time = 1.58688 seconds for 10000 particles.
+Simulation Time = 1.74149 seconds for 10000 particles.
 Check between stest1.out and mpi_base_verf1.out succeeded!
 Check between stest2.out and mpi_base_verf2.out succeeded!
 Check between stest3.out and mpi_base_verf3.out succeeded!
@@ -16,10 +16,10 @@ Check between stest5.out and mpi_base_verf5.out succeeded!
 --- END SERIAL-CORRECTNESS ---
 
 --- PARALLEL-CORRECTNESS ---
-Simulation Time = 1.19982 seconds for 10000 particles.
-Simulation Time = 1.23841 seconds for 10000 particles.
-Simulation Time = 1.14911 seconds for 10000 particles.
-Simulation Time = 1.1978 seconds for 10000 particles.
+Simulation Time = 1.326 seconds for 10000 particles.
+Simulation Time = 2.15453 seconds for 10000 particles.
+Simulation Time = 2.08048 seconds for 10000 particles.
+Simulation Time = 1.26423 seconds for 10000 particles.
 Check between otest1.out and mpi_scaling_verf1.out succeeded!
 Check between otest2.out and mpi_scaling_verf2.out succeeded!
 Check between otest3.out and mpi_scaling_verf3.out succeeded!
@@ -27,19 +27,19 @@ Check between otest4.out and mpi_scaling_verf4.out succeeded!
 --- END PARALLEL-CORRECTNESS ---
 
 --- SERIAL ---
-Simulation Time = 5.57215 seconds for 100000 particles.
+Simulation Time = 5.53533 seconds for 100000 particles.
 --- END SERIAL ---
 
 --- SCALE_1M ---
-Simulation Time = 2.48082 seconds for 1000000 particles.
-Simulation Time = 1.32922 seconds for 1000000 particles.
-Simulation Time = 0.821995 seconds for 1000000 particles.
+Simulation Time = 2.40908 seconds for 1000000 particles.
+Simulation Time = 1.35544 seconds for 1000000 particles.
+Simulation Time = 0.876576 seconds for 1000000 particles.
 --- END SCALE_1M ---
 
 --- SCALE_2M ---
-Simulation Time = 6.38452 seconds for 2000000 particles.
-Simulation Time = 2.91949 seconds for 2000000 particles.
-Simulation Time = 1.65729 seconds for 2000000 particles.
+Simulation Time = 6.24104 seconds for 2000000 particles.
+Simulation Time = 3.0848 seconds for 2000000 particles.
+Simulation Time = 1.71794 seconds for 2000000 particles.
 --- END SCALE_2M ---
 
 ===== END CS5220 HW3 LEADERBOARD SUBMISSION =====
