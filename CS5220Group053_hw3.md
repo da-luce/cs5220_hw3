@@ -24,4 +24,4 @@ Citations are present in code comments where papers or generative AI were used/r
 
 - The use of vectors. Google Gemini highlighted from the get-go that my buffers should be CPP vectors, as OpenMPI requires contiguous memory for communication. - Confirmed what buffers I needed for correct communication with my decomposition
 - Google Gemini also suggested the ghost exchange should be made async, meaning ghosts are exchanged while bins within each slice are calculated. I implemented this and it improved my parallel efficiency.
-- Google Gemini also helped with my understanding of the OpenMPI API, specifically understanding how to use request tags to wait on multiple directions of ghost particle exchanges at the same time.
+- Google Gemini also helped with my understanding of the OpenMPI API, specifically with how to use request tags to wait on multiple directions of ghost particle exchanges at the same time.
